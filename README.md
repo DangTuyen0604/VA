@@ -149,8 +149,7 @@ python - <<'EOF' | tee runs/arms.txt
 import glob, h5py
 from data import working_arm
 for p in sorted(glob.glob("/home/toann/hoanglmv/dataset/2026-10-13/*.hdf5")):
-    arm, travel = working_arm(h5py.File(p, "r")["observations/qpos"][:])
-    print(p.split("/")[-1], ["LEFT ", "RIGHT"][arm], f"left {travel[0]:.2f} rad, right {travel[1]:.2f} rad")
+    arm, travel = working_arm(h5py.File(p, "r")["observations/qpos"][:])print(p.split("/")[-1], ["LEFT ", "RIGHT"][arm], f"left {travel[0]:.2f} rad, right {travel[1]:.2f} rad")
 EOF
 
 # 3. Chạy thử Qwen 25 bước (mục 1 và 3), nên chạy trong tmux

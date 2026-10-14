@@ -1,0 +1,13 @@
+# The GPU machine's environment, not the robot's (utils/ keeps a CPU-only
+# torch). Install torch for that machine's CUDA first, e.g.
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+torch>=2.4
+torchvision>=0.19
+# Qwen3-VL arrived in transformers 4.57.
+transformers>=4.57
+pillow
+h5py>=3.8
+numpy
+# Logging: tensorboard --logdir <out>/tb; matplotlib draws the chunk plots.
+tensorboard
+matplotlib

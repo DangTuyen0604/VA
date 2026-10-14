@@ -1,0 +1,8 @@
+# Training runs: checkpoints, TensorBoard logs, evaluation outputs.
+runs/
+*.pt
+# Episodes stay beside the robot, not in the history.
+*.hdf5
+dataset/
+__pycache__/
+*.py[cod]

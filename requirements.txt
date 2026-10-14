@@ -1,6 +1,8 @@
 # The GPU machine's environment, not the robot's (utils/ keeps a CPU-only
 # torch). Install torch for that machine's CUDA first, e.g.
-#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+# An RTX 50xx (Blackwell, sm_120) needs torch >= 2.7 built for CUDA 12.8 or
+# newer; a cu124 build fails there with "no kernel image is available".
 torch>=2.4
 torchvision>=0.19
 # Qwen3-VL arrived in transformers 4.57.

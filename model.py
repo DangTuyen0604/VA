@@ -159,7 +159,7 @@ class QwenBackbone(nn.Module):
         from transformers import Qwen3VLForConditionalGeneration
 
         download(name)
-        full =Qwen3VLForConditionalGeneration.from_pretrained(name, dtype=dtype)
+        full = Qwen3VLForConditionalGeneration.from_pretrained(name, dtype=dtype)
         self.model = full.model
         self.model.requires_grad_(False)
         self.model.eval()

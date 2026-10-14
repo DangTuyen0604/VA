@@ -43,6 +43,73 @@ def highway_layers(num_layers, count):
 
 # ----------------------------------------------------------------- backbones
 
+def download(name, every=5.0):
+    """Fetch a hub model into the Hugging Face cache, a line every `every` s:
+    GB so far, %, MB/s, time left. The hub's own bars redraw with \\r, so a
+    pipe or a log file shows none of them; these lines survive both. A local
+    folder, or a model already cached, returns at once."""
+    import os
+    import threading
+    import time
+
+    from huggingface_hub import HfApi, constants, snapshot_download
+    from huggingface_hub.utils import disable_progress_bars, enable_progress_bars
+
+    if os.path.isdir(name):
+        return
+    try:
+        snapshot_download(name, local_files_only=True)
+        return
+    except Exception:
+        pass
+    try:
+        info = HfApi().model_info(name, files_metadata=True)
+        total = sum(f.size or 0 for f in info.siblings) or None
+    except Exception:
+        total = None                        # offline or gated: let the download say
+    blobs = os.path.join(constants.HF_HUB_CACHE,
+                         "models--" + name.replace("/", "--"), "blobs")
+
+    def done():
+        # Blocks on disk, not st_size: a file written out of order (Xet) is sparse.
+        if not os.path.isdir(blobs):
+            return 0
+        sizes = (os.stat(e.path) for e in os.scandir(blobs) if e.is_file())
+        return sum(min(s.st_size, s.st_blocks * 512) for s in sizes)
+
+    def report(stop):
+        last, last_t = done(), time.time()
+        while not stop.wait(every):
+            now, now_t = done(), time.time()
+            rate = (now - last) / (now_t - last_t)
+            last, last_t = now, now_t
+            line = f"  {name}: {now / 1e9:.2f}"
+            if total:
+                line += f" / {total / 1e9:.2f} GB ({100 * now / total:.0f}%)"
+            else:
+                line += " GB"
+            line += f", {rate / 1e6:.0f} MB/s"
+            if total and rate > 0:
+                left = max(0, total - now) / rate
+                line += f", ~{left / 60:.0f} min left" if left >= 60 else f", ~{left:.0f} s left"
+            print(line, flush=True)
+
+    size = f"{total / 1e9:.2f} GB" if total else "size unknown"
+    print(f"downloading {name} ({size}) into {constants.HF_HUB_CACHE}", flush=True)
+    started = time.time()
+    stop = threading.Event()
+    thread = threading.Thread(target=report, args=(stop,), daemon=True)
+    disable_progress_bars()
+    thread.start()
+    try:
+        snapshot_download(name)
+    finally:
+        stop.set()
+        thread.join()
+        enable_progress_bars()
+    print(f"downloaded {name} in {time.time() - started:.0f} s", flush=True)
+
+
 class QwenInputs:
     """Qwen3-VL's processor, held at 640x480: run in the loader's workers.
 
@@ -91,7 +158,8 @@ class QwenBackbone(nn.Module):
         super().__init__()
         from transformers import Qwen3VLForConditionalGeneration
 
-        full = Qwen3VLForConditionalGeneration.from_pretrained(name, dtype=dtype)
+        download(name)
+        full =Qwen3VLForConditionalGeneration.from_pretrained(name, dtype=dtype)
         self.model = full.model
         self.model.requires_grad_(False)
         self.model.eval()

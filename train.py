@@ -231,7 +231,6 @@ def main():
             from transformers import AutoConfig
             layers = AutoConfig.from_pretrained(args.backbone).text_config.num_hidden_layers
             probe_layers = layers // 2
-        # Silent otherwise: the download's progress bar rarely survives a pipe.
         print(f"loading {args.backbone} (the first run downloads it, ~4.5 GB for "
               f"the 2B, into ~/.cache/huggingface)...", flush=True)
         started = time.time()

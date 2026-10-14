@@ -126,3 +126,39 @@ into 2 arms × 8.
 - Output is absolute joint targets, 8 per arm, not the end-effector pose:
   no camera extrinsics to put a pose in a camera frame. So `act_head` is
   768→8, there is no `abs_pos_enc`, and the APT checkpoint does not load.
+
+
+
+
+  # 0. Lấy code (thay cho scp)
+cd ~/hoanglmv
+git clone https://github.com/DangTuyen0604/VA.git      # lần sau: cd VA && git pull
+cd VA && mkdir -p runs
+
+# 1. Kiểm tra môi trường: cần cuda True, transformers >= 4.57, GPU 1 trống
+python -c "import torch, transformers; print('torch', torch.__version__, '| cuda', torch.cuda.is_available(), '| GPUs', torch.cuda.device_count(), '| transformers', transformers.__version__)"
+nvidia-smi
+
+# 2b. Danh sách tay của từng episode (mục 2)
+python - <<'EOF' | tee runs/arms.txt
+import glob, h5py
+from data import working_arm
+for p in sorted(glob.glob("/home/toann/hoanglmv/dataset/2026-10-13/*.hdf5")):
+    arm, travel = working_arm(h5py.File(p, "r")["observations/qpos"][:])
+    print(p.split("/")[-1], ["LEFT ", "RIGHT"][arm], f"left {travel[0]:.2f} rad, right {travel[1]:.2f} rad")
+EOF
+
+# 3. Chạy thử Qwen 25 bước (mục 1 và 3), nên chạy trong tmux
+CUDA_VISIBLE_DEVICES=1 python -u train.py \
+    --data /home/toann/hoanglmv/dataset/2026-10-13 \
+    --out runs/check_qwen \
+    --backbone Qwen/Qwen3-VL-2B-Instruct \
+    --batch 32 --steps 25 --log-every 5 \
+    --eval-every 20 --eval-batches 2 \
+    --val-episodes 4 --workers 4 --device cuda \
+    2>&1 | tee runs/check_qwen.out
+
+# 4. Gửi mình
+head -60 runs/check_qwen.out
+cat runs/arms.txt
+

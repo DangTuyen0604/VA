@@ -148,8 +148,49 @@ def depth_input(depth_mm, depth_range_m):
     return np.stack([norm, valid.astype(np.float32)], axis=-3)
 
 
+def jitter_colour(rgb, rng, strength=0.2):
+    """(H, W, 3) uint8 with its saturation, contrast and brightness each
+    scaled by a factor in 1 ± strength.
+
+    The three are linear, so they fold into one pass: saturation s gives
+    gray + s (x - gray), whose mean is still the frame's mean m; contrast c
+    gives c (y - m) + m and brightness b scales that, so the result is
+    b c s x + b c (1 - s) gray + b (1 - c) m.
+    """
+    s, c, b = rng.uniform(1 - strength, 1 + strength, size=3)
+    x = rgb.astype(np.float32)
+    gray = (x[..., :1] + x[..., 1:2] + x[..., 2:]) / 3
+    m = float(gray.mean())
+    gray *= b * c * (1 - s)
+    gray += b * (1 - c) * m
+    x *= b * c * s
+    x += gray
+    np.clip(x, 0, 255, out=x)
+    return x.astype(np.uint8)
+
+
+def shift(image, dy, dx, rows_axis, mode):
+    """`image` moved dy px down and dx right, its size kept: rows and columns
+    are axes rows_axis and rows_axis + 1, and the uncovered edge is filled
+    as np.pad's `mode` fills it."""
+    s = max(abs(dy), abs(dx))
+    pad = [(0, 0)] * image.ndim
+    pad[rows_axis] = pad[rows_axis + 1] = (s, s)
+    padded = np.pad(image, pad, mode=mode)
+    h, w = image.shape[rows_axis], image.shape[rows_axis + 1]
+    window = [slice(None)] * image.ndim
+    window[rows_axis] = slice(s - dy, s - dy + h)
+    window[rows_axis + 1] = slice(s - dx, s - dx + w)
+    return padded[tuple(window)]
+
+
 class EpisodeDataset(Dataset):
-    def __init__(self, paths, stats, chunk=50, depth_range_m=(0.2, 1.2), arms=None):
+    """`augment`: each camera's frame colour-jittered and shifted up to
+    `shift_px` each way, its depth by the same amount so a depth token stays
+    on its image token's cell. For training only."""
+
+    def __init__(self, paths, stats, chunk=50, depth_range_m=(0.2, 1.2), arms=None,
+                 augment=False, shift_px=16):
         self.paths = list(paths)
         self.arms = list(arms) if arms is not None else [
             working_arm(h5py.File(p, "r")["observations/qpos"][:])[0] for p in self.paths]
@@ -163,8 +204,11 @@ class EpisodeDataset(Dataset):
                 length = f["observations/qpos"].shape[0]
             # The last step has no future to learn.
             self.index.extend((i, t) for t in range(length - 1))
+        self.augment = augment
+        self.shift_px = int(shift_px)
         self._files = {}
         self._pid = None
+        self._rng = None
 
     def __len__(self):
         return len(self.index)
@@ -177,9 +221,11 @@ class EpisodeDataset(Dataset):
         return out
 
     def _file(self, i):
-        # h5py handles do not survive a fork: each worker opens its own.
+        # h5py handles do not survive a fork: each worker opens its own. Its
+        # draws too, from its torch seed, which differs per worker and run.
         if self._pid != os.getpid():
             self._files, self._pid = {}, os.getpid()
+            self._rng = np.random.default_rng(torch.initial_seed())
         if i not in self._files:
             self._files[i] = h5py.File(self.paths[i], "r")
         return self._files[i]
@@ -198,9 +244,16 @@ class EpisodeDataset(Dataset):
             future = np.concatenate(
                 [future, np.repeat(future[-1:], self.chunk - len(future), axis=0)])
         images = f["observations/images"]
-        rgb = np.stack([images[f"{c}_rgb"][t] for c in CAMERAS])
-        depth = depth_input(np.stack([images[f"{c}_depth"][t] for c in CAMERAS]),
-                            self.depth_range_m)
+        rgb = [images[f"{c}_rgb"][t] for c in CAMERAS]
+        depth = [depth_input(images[f"{c}_depth"][t], self.depth_range_m) for c in CAMERAS]
+        if self.augment:
+            for c in range(len(CAMERAS)):
+                dy, dx = (int(v) for v in self._rng.integers(
+                    -self.shift_px, self.shift_px + 1, size=2))
+                rgb[c] = shift(jitter_colour(rgb[c], self._rng), dy, dx, 0, "edge")
+                # 0 is "not measured", in both the depth and its valid mask.
+                depth[c] = shift(depth[c], dy, dx, 1, "constant")
+        rgb, depth = np.stack(rgb), np.stack(depth)
         return {
             "rgb": torch.from_numpy(rgb),
             "depth": torch.from_numpy(depth),

@@ -18,11 +18,22 @@ the training loss, gradient norm and learning rate, the held-out errors 1, 10
 and Ta steps ahead, and at each evaluation one held-out chunk drawn against
 what the right arm did.
 
+The training frames are augmented (--no-augment to turn it off): each
+camera's colour jittered and the frame shifted up to --shift-px, its depth
+with it, so the recording's light and camera placement are not learnt by
+heart. Evaluation sees the frames as recorded, the same held-out batches and
+the same noise every time, so a change in its errors is the model's.
+
+The expert's weights are averaged as it trains (EMA, --ema): evaluation,
+best.pt and what infer.py loads are the average, smoother than the last step.
+
 A checkpoint holds the expert only (the backbone is frozen and reloaded by
-name), the qpos stats the actions are normalised with, and the settings.
+name): the average as "expert", the trained weights as "expert_train" for
+--resume, the qpos stats the actions are normalised with, and the settings.
 """
 
 import argparse
+import copy
 import json
 import math
 import os
@@ -63,6 +74,12 @@ def parse_args():
     p.add_argument("--weight-decay", type=float, default=1e-4)
     p.add_argument("--warmup", type=int, default=1000)
     p.add_argument("--grad-clip", type=float, default=1.0)
+    p.add_argument("--ema", type=float, default=0.9999,
+                   help="the decay the weight average ramps up to; 0 = no average")
+    p.add_argument("--no-augment", action="store_true",
+                   help="train on the frames as recorded: no colour jitter, no shift")
+    p.add_argument("--shift-px", type=int, default=16,
+                   help="largest random shift of a training frame, each way")
     p.add_argument("--val-episodes", type=int, default=2,
                    help="held out: the newest N, split between left- and right-arm grasps")
     p.add_argument("--no-balance", action="store_true",
@@ -106,6 +123,18 @@ def lr_at(step, args):
     return args.lr * 0.5 * (1 + math.cos(math.pi * min(1.0, progress)))
 
 
+def ema_decay(step, top):
+    """Diffusion Policy's warm-up, 1 - (1 + step)^-0.75 up to `top`: 0 at the
+    first step, 0.9 by step 20, 0.999 by 10k, so early weights fade fast."""
+    return min(top, 1 - (1 + step) ** -0.75)
+
+
+@torch.no_grad()
+def ema_update(ema, model, decay):
+    for average, weight in zip(ema.parameters(), model.parameters()):
+        average.lerp_(weight, 1 - decay)
+
+
 def horizons(chunk):
     return sorted({1, 10, chunk} & set(range(1, chunk + 1)))
 
@@ -118,7 +147,11 @@ def evaluate(policy, loader, args, std, device, autocast):
     by_kind = {name: [] for name in ARM_NAMES}
     ahead = {h: [] for h in horizons(args.chunk)}
     example = None
-    for i, batch in enumerate(loader):
+    batches = iter(loader)
+    # Seeded once the loader has drawn its workers' seeds, which it does more
+    # often the first time than after: the same noise at every evaluation.
+    torch.manual_seed(args.seed)
+    for i, batch in enumerate(batches):
         if i >= args.eval_batches:
             break
         batch = to_device(batch, device)
@@ -185,10 +218,14 @@ def chunk_figure(example, mean, std):
     return fig
 
 
-def save(path, policy, optimizer, step, args, stats, metrics):
-    checkpoint = {"expert": policy.expert.state_dict(), "optimizer": optimizer.state_dict(),
+def save(path, policy, ema, optimizer, step, args, stats, metrics):
+    expert = ema if ema is not None else policy.expert
+    checkpoint = {"expert": expert.state_dict(), "optimizer": optimizer.state_dict(),
                   "step": step, "args": vars(args), "stats": stats,
                   "highway_layers": policy.backbone.layers, "metrics": metrics}
+    if ema is not None:
+        # What --resume trains on; "expert", what infer.py loads, is the average.
+        checkpoint["expert_train"] = policy.expert.state_dict()
     if args.backbone == "dummy":
         # Random, so kept: infer.py needs the same one. Qwen reloads by name.
         checkpoint["dummy_backbone"] = policy.backbone.state_dict()
@@ -244,7 +281,8 @@ def main():
     print(f"expert: {len(policy.expert.blocks)} blocks, {trainable / 1e6:.1f} M parameters")
 
     print("indexing the frames...", flush=True)
-    train_set = EpisodeDataset(train_eps, stats, args.chunk, arms=train_arms)
+    train_set = EpisodeDataset(train_eps, stats, args.chunk, arms=train_arms,
+                               augment=not args.no_augment, shift_px=args.shift_px)
     val_set = EpisodeDataset(val_eps, stats, args.chunk, arms=val_arms)
     collate = Collate(prepare)
     common = dict(num_workers=args.workers, collate_fn=collate,
@@ -255,9 +293,11 @@ def main():
     else:
         train_loader = DataLoader(train_set, batch_sampler=BalancedBatchSampler(
             train_set.groups(), args.batch, args.seed), **common)
-    # Balanced as well, so the few evaluation batches grade both kinds.
-    val_loader = DataLoader(val_set, batch_sampler=BalancedBatchSampler(
-        val_set.groups(), args.batch, args.seed + 1), **common)
+    # Balanced as well, so the few evaluation batches grade both kinds, and
+    # drawn once: every evaluation grades the same frames.
+    val_batches = list(BalancedBatchSampler(
+        val_set.groups(), args.batch, args.seed + 1))[:args.eval_batches]
+    val_loader = DataLoader(val_set, batch_sampler=val_batches, **common)
     print(f"{len(train_set)} train / {len(val_set)} val frames; "
           f"{args.batch} x {args.grad_accum} samples a step, "
           f"{len(train_set) / (args.batch * args.grad_accum):.0f} steps an epoch")
@@ -267,10 +307,15 @@ def main():
     start = 0
     if args.resume:
         checkpoint = torch.load(args.resume, map_location="cpu", weights_only=False)
-        policy.expert.load_state_dict(checkpoint["expert"])
+        policy.expert.load_state_dict(checkpoint.get("expert_train", checkpoint["expert"]))
         optimizer.load_state_dict(checkpoint["optimizer"])
         start = checkpoint["step"]
         print(f"resumed from {args.resume} at step {start}")
+    ema = None
+    if args.ema > 0:
+        ema = copy.deepcopy(policy.expert).requires_grad_(False)
+        if args.resume and "expert_train" in checkpoint:
+            ema.load_state_dict(checkpoint["expert"])
 
     use_bf16 = not args.no_bf16 and device.type == "cuda"
 
@@ -308,6 +353,8 @@ def main():
             total += loss.item()
         grad = torch.nn.utils.clip_grad_norm_(policy.expert.parameters(), args.grad_clip)
         optimizer.step()
+        if ema is not None:
+            ema_update(ema, policy.expert, ema_decay(step, args.ema))
         seen += 1
 
         done = step + 1
@@ -327,7 +374,14 @@ def main():
                     if key != "step":
                         writer.add_scalar(f"train/{key}", value, done)
         if done % args.eval_every == 0 or done == args.steps:
-            metrics, example = evaluate(policy, val_loader, args, std, device, autocast)
+            # The average, under the same noise every time; then the trained
+            # weights back, and the training's random state as it was.
+            trained = policy.expert
+            if ema is not None:
+                policy.expert = ema
+            with torch.random.fork_rng(devices=[device] if device.type == "cuda" else []):
+                metrics, example = evaluate(policy, val_loader, args, std, device, autocast)
+            policy.expert = trained
             print("eval " + " ".join(f"{k} {v:.4g}" for k, v in metrics.items()), flush=True)
             log.write(json.dumps({"step": done, **metrics}) + "\n")
             log.flush()
@@ -341,10 +395,11 @@ def main():
                 writer.flush()
             if metrics["val_joint_rad"] < best:
                 best = metrics["val_joint_rad"]
-                save(os.path.join(args.out, "best.pt"), policy, optimizer, done, args,
+                save(os.path.join(args.out, "best.pt"), policy, ema, optimizer, done, args,
                      stats, metrics)
         if done % args.save_every == 0 or done == args.steps:
-            save(os.path.join(args.out, "last.pt"), policy, optimizer, done, args, stats, {})
+            save(os.path.join(args.out, "last.pt"), policy, ema, optimizer, done, args,
+                 stats, {})
     log.close()
     if writer is not None:
         writer.close()

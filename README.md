@@ -117,6 +117,11 @@ into 2 arms × 8.
   memory. Qwen runs in bf16 without gradients; only the expert trains.
 - `--val-episodes 2`: the newest of each kind of episode is held out.
   Split by episode, never by frame.
+- `--ema 0.9999`: the expert's weights are averaged as it trains; evaluation,
+  `best.pt` and `infer.py` use the average. `0` turns it off.
+- Training frames are colour-jittered and shifted up to `--shift-px 16`,
+  depth with them; `--no-augment` trains on them as recorded. Evaluation
+  grades the same held-out batches under the same noise every time.
 
 ## Departures from the paper design
 

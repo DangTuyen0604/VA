@@ -95,6 +95,9 @@ def parse_args():
     p.add_argument("--no-tensorboard", action="store_true", help="only log.jsonl")
     p.add_argument("--workers", type=int, default=4)
     p.add_argument("--device", default="cuda")
+    p.add_argument("--gpu-mem-gb", type=float, default=0,
+                   help="the most GPU memory (GiB) this run may take, for sharing a GPU "
+                        "with another run: past it this one runs out, not the other; 0 = no cap")
     p.add_argument("--no-bf16", action="store_true", help="train the expert in fp32")
     p.add_argument("--resume", default="", help="a checkpoint .pt to continue from")
     p.add_argument("--seed", type=int, default=0)
@@ -239,6 +242,12 @@ def main():
     np.random.seed(args.seed)
     os.makedirs(args.out, exist_ok=True)
     device = torch.device(args.device)
+    if args.gpu_mem_gb > 0 and device.type == "cuda":
+        # PyTorch's own memory only: the CUDA context (~0.5 GiB) comes on top.
+        total = torch.cuda.get_device_properties(device).total_memory
+        torch.cuda.set_per_process_memory_fraction(min(1.0, args.gpu_mem_gb * 2**30 / total),
+                                                   device)
+        print(f"GPU memory capped at {args.gpu_mem_gb:g} of {total / 2**30:.1f} GiB")
 
     print(f"checking the episodes under {args.data}", flush=True)
     episodes = list_episodes(args.data)
@@ -365,6 +374,9 @@ def main():
             if device.type == "cuda":
                 # The peak since the start: what --batch costs, eval included.
                 record["gpu_mem_gb"] = torch.cuda.max_memory_allocated(device) / 2**30
+                # What the allocator holds, close to what nvidia-smi shows: the
+                # number to keep under --gpu-mem-gb when sharing a GPU.
+                record["gpu_reserved_gb"] = torch.cuda.max_memory_reserved(device) / 2**30
             print(" ".join(f"{k} {v:.4g}" if isinstance(v, float) else f"{k} {v}"
                            for k, v in record.items()), flush=True)
             log.write(json.dumps(record) + "\n")
